@@ -1,0 +1,21 @@
+#IDE
+.idea
+
+target
+neardev
+
+# OS X
+.DS_Store
+.vscode
+res/*
+
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+TODO_*.md
+review-notes/
+docs/audit_*
+docs/refactor_*
+docs/*_plan.md
+docs/plan_*.md
+docs/*_analysis.md

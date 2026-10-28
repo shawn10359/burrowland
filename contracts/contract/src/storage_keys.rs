@@ -1,0 +1,13 @@
+pub const CLIENT_ECHO_SENDER_WHITELIST: &str = "csw";
+pub const MARGIN_BASE_TOKEN_LIMIT_GUR: &str = "bg";
+pub const MARGIN_BASE_TOKEN_LIMIT: &str = "bl";
+pub const BOOSTER_TOKENS_KEY: &str = "bt";
+pub const MARGIN_STOP_SERVICE_FEE: &str = "mssf";
+pub const PROTOCOL_DEBTS_KEY: &str = "pd";
+pub const RELIABLE_LIQUIDATOR_WHITELIST: &str = "rlw";
+pub const MAINTENANCE_MODE_WHITELIST: &str = "mmw";
+pub const DELIST_TOKEN_LIST: &str = "dtl";
+#[deprecated(note = "storage key used by removed owner one-shot withdrawal; keep reserved to avoid reuse")]
+pub const OWNER_ONE_SHOT_WITHDRAW_USED: &str = "oowu";
+pub const MARGIN_PENDING_ACTION_PREFIX: &str = "mpa";
+pub const MARGIN_OPERATOR_KEY: &str = "mo";

@@ -1,0 +1,557 @@
+use crate::*;
+
+#[derive(Deserialize, Serialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Debug))]
+#[serde(crate = "near_sdk::serde")]
+pub enum MarginAction {
+    Withdraw {
+        token_id: AccountId,
+        amount: Option<U128>,
+    },
+    IncreaseCollateral {
+        pos_id: PosId,
+        amount: U128,
+    },
+    DecreaseCollateral {
+        pos_id: PosId,
+        amount: U128,
+    },
+    OpenPosition {
+        token_c_id: AccountId,
+        token_c_amount: U128,
+        token_d_id: AccountId,
+        token_d_amount: U128,
+        token_p_id: AccountId,
+        min_token_p_amount: U128,
+        swap_indication: SwapIndication,
+        stop_profit: Option<u32>,
+        stop_loss: Option<u32>,
+    },
+    DecreaseMTPosition {
+        pos_id: PosId,
+        token_p_amount: U128,
+        min_token_d_amount: U128,
+        swap_indication: SwapIndication,
+    },
+    CloseMTPosition {
+        pos_id: PosId,
+        token_p_amount: U128,
+        min_token_d_amount: U128,
+        swap_indication: SwapIndication,
+    },
+    LiquidateMTPosition {
+        pos_owner_id: AccountId,
+        pos_id: PosId,
+        token_p_amount: U128,
+        min_token_d_amount: U128,
+        swap_indication: SwapIndication,
+    },
+    ForceCloseMTPosition {
+        pos_owner_id: AccountId,
+        pos_id: PosId,
+        token_p_amount: U128,
+        min_token_d_amount: U128,
+        swap_indication: SwapIndication,
+    },
+    StopMTPosition {
+        pos_owner_id: AccountId,
+        pos_id: PosId,
+        token_p_amount: U128,
+        min_token_d_amount: U128,
+        swap_indication: SwapIndication,
+    },
+    SetStop {
+        pos_id: PosId,
+        stop_profit: Option<u32>,
+        stop_loss: Option<u32>,
+    },
+}
+
+pub const MARGIN_CLOSED_ENTRYPOINT_MSG: &str =
+    "Margin entrypoint is closed; use margin_execute_with_pyth with MarginAction::Withdraw to withdraw supply";
+pub const MARGIN_UNSUPPORTED_ACTION_MSG: &str =
+    "Margin is closed; only MarginAction::Withdraw is supported";
+
+pub(crate) fn assert_margin_actions_withdraw_only(actions: &[MarginAction]) {
+    for action in actions {
+        if !matches!(action, MarginAction::Withdraw { .. }) {
+            env::panic_str(MARGIN_UNSUPPORTED_ACTION_MSG);
+        }
+    }
+}
+
+impl MarginAction {
+    pub fn action_type(&self) -> MarginActionType {
+        match self {
+            MarginAction::Withdraw { .. } => MarginActionType::Withdraw,
+            MarginAction::IncreaseCollateral { .. } => MarginActionType::IncreaseCollateral,
+            MarginAction::DecreaseCollateral { .. } => MarginActionType::DecreaseCollateral,
+            MarginAction::OpenPosition { .. } => MarginActionType::OpenPosition,
+            MarginAction::DecreaseMTPosition { .. } => MarginActionType::DecreaseMTPosition,
+            MarginAction::CloseMTPosition { .. } => MarginActionType::CloseMTPosition,
+            MarginAction::LiquidateMTPosition { .. } => MarginActionType::LiquidateMTPosition,
+            MarginAction::ForceCloseMTPosition { .. } => MarginActionType::ForceCloseMTPosition,
+            MarginAction::StopMTPosition { .. } => MarginActionType::StopMTPosition,
+            MarginAction::SetStop { .. } => MarginActionType::SetStop,
+        }
+    }
+}
+
+impl Contract {
+    fn assert_margin_actions_enabled(&self, actions: &[MarginAction], margin_config: &MarginConfig) {
+        for action in actions {
+            let action_type = action.action_type();
+            assert!(
+                margin_config.is_action_enabled(&action_type),
+                "Margin action {:?} is not enabled",
+                action_type,
+            );
+        }
+    }
+
+    pub fn internal_margin_execute(
+        &mut self,
+        account_id: &AccountId,
+        account: &mut MarginAccount,
+        actions: Vec<MarginAction>,
+        prices: Prices,
+    ) {
+        assert_margin_actions_withdraw_only(&actions);
+        // Set reliable liquidator context if signer is in whitelist
+        self.is_reliable_liquidator_context = in_reliable_liquidator_whitelist(&env::signer_account_id().to_string());
+
+        self.internal_set_prices(&prices);
+        let ts = env::block_timestamp();
+        let margin_config = self.internal_margin_config();
+        self.assert_margin_actions_enabled(&actions, &margin_config);
+        for action in actions {
+            match action {
+                MarginAction::OpenPosition {
+                    token_c_id: margin_asset_id,
+                    token_c_amount: margin_amount,
+                    token_d_id: debt_asset_id,
+                    token_d_amount: debt_amount,
+                    token_p_id: position_asset_id,
+                    min_token_p_amount: min_position_amount,
+                    swap_indication,
+                    stop_profit,
+                    stop_loss,
+                } => {
+                    let event = self.internal_margin_open_position(
+                        ts,
+                        account,
+                        &margin_asset_id,
+                        margin_amount.into(),
+                        &debt_asset_id,
+                        debt_amount.into(),
+                        &position_asset_id,
+                        min_position_amount.into(),
+                        &swap_indication,
+                        &prices,
+                        &stop_profit,
+                        &stop_loss,
+                    );
+                    events::emit::margin_open_started(event);
+                }
+                MarginAction::IncreaseCollateral { pos_id, amount } => {
+                    let (token_id, actual_amount) = self.internal_margin_increase_collateral(account, &pos_id, amount.into());
+                    events::emit::increase_collateral(&account_id, actual_amount, &token_id, &pos_id);
+                }
+                MarginAction::DecreaseCollateral { pos_id, amount } => {
+                    let token_id = self.internal_margin_decrease_collateral(
+                        account,
+                        &pos_id,
+                        amount.into(),
+                        &prices,
+                    );
+                    events::emit::decrease_collateral(&account_id, amount.0, &token_id, &pos_id);
+                }
+                MarginAction::DecreaseMTPosition {
+                    pos_id,
+                    token_p_amount: position_amount,
+                    min_token_d_amount: min_debt_amount,
+                    swap_indication,
+                } => {
+                    let event = self.process_decrease_margin_position(
+                        account,
+                        &pos_id,
+                        position_amount.into(),
+                        min_debt_amount.into(),
+                        &swap_indication,
+                        &prices,
+                        "decrease".to_string(),
+                        None,
+                    );
+                    events::emit::margin_decrease_started("margin_decrease_started", event);
+                }
+                MarginAction::CloseMTPosition {
+                    pos_id,
+                    token_p_amount: position_amount,
+                    min_token_d_amount: min_debt_amount,
+                    swap_indication,
+                } => {
+                    let event = self.process_decrease_margin_position(
+                        account,
+                        &pos_id,
+                        position_amount.into(),
+                        min_debt_amount.into(),
+                        &swap_indication,
+                        &prices,
+                        "close".to_string(),
+                        None,
+                    );
+                    events::emit::margin_decrease_started("margin_close_started", event);
+                }
+                MarginAction::LiquidateMTPosition {
+                    pos_owner_id,
+                    pos_id,
+                    token_p_amount: position_amount,
+                    min_token_d_amount: min_debt_amount,
+                    swap_indication,
+                } => {
+                    self.assert_liquidation_allowed_in_current_mode(account_id);
+                    assert_ne!(
+                        account_id, &pos_owner_id,
+                        "Can't liquidate yourself"
+                    );
+                    let mut pos_owner = self.internal_unwrap_margin_account(&pos_owner_id);
+                    let event = self.process_decrease_margin_position(
+                        &mut pos_owner,
+                        &pos_id,
+                        position_amount.into(),
+                        min_debt_amount.into(),
+                        &swap_indication,
+                        &prices,
+                        "liquidate".to_string(),
+                        Some(account_id.clone()),
+                    );
+                    self.internal_set_margin_account(&pos_owner_id, pos_owner);
+                    events::emit::margin_decrease_started("margin_liquidate_started", event);
+                }
+                MarginAction::ForceCloseMTPosition {
+                    pos_owner_id,
+                    pos_id,
+                    token_p_amount: position_amount,
+                    min_token_d_amount: min_debt_amount,
+                    swap_indication,
+                } => {
+                    self.assert_liquidation_allowed_in_current_mode(account_id);
+                    assert_ne!(
+                        account_id, &pos_owner_id,
+                        "Can't liquidate yourself"
+                    );
+                    let config = self.internal_config();
+                    assert!(
+                        config.force_closing_enabled,
+                        "The force closing is not enabled"
+                    );
+                    let mut pos_owner = self.internal_unwrap_margin_account(&pos_owner_id);
+                    let event = self.process_decrease_margin_position(
+                        &mut pos_owner,
+                        &pos_id,
+                        position_amount.into(),
+                        min_debt_amount.into(),
+                        &swap_indication,
+                        &prices,
+                        "forceclose".to_string(),
+                        None,
+                    );
+                    self.internal_set_margin_account(&pos_owner_id, pos_owner);
+                    events::emit::margin_decrease_started("margin_forceclose_started", event);
+                }
+                MarginAction::StopMTPosition {
+                    pos_owner_id,
+                    pos_id,
+                    token_p_amount: position_amount,
+                    min_token_d_amount: min_debt_amount,
+                    swap_indication,
+                } => {
+                    self.assert_liquidation_allowed_in_current_mode(account_id);
+                    assert_ne!(
+                        account_id, &pos_owner_id,
+                        "Can't stop yourself"
+                    );
+                    // Fail-safe: ensure keeper has a margin account to receive service fee
+                    assert!(
+                        self.internal_get_margin_account(&account_id).is_some(),
+                        "Keeper must have a margin account to execute stops"
+                    );
+                    let mut pos_owner = self.internal_unwrap_margin_account(&pos_owner_id);
+                    let mt = pos_owner.margin_positions.get(&pos_id).expect("Position not found");
+                    let margin_stop = pos_owner.stops.get(&pos_id).expect("Margin position has no stop settings");
+                    let stop_op = self.is_stop_active(&mt, &prices, &margin_stop, 0)
+                        .expect("Margin position is not stopable yet");
+                    let stop_started_event = if stop_op == "stop_loss" { "margin_stop_loss_started" } else { "margin_stop_profit_started" };
+                    let event = self.process_decrease_margin_position(
+                        &mut pos_owner,
+                        &pos_id,
+                        position_amount.into(),
+                        min_debt_amount.into(),
+                        &swap_indication,
+                        &prices,
+                        stop_op.to_string(),
+                        Some(account_id.clone()),
+                    );
+                    self.internal_set_margin_account(&pos_owner_id, pos_owner);
+                    events::emit::margin_decrease_started(stop_started_event, event);
+                }
+                MarginAction::Withdraw { token_id, amount } => {
+                    assert!(!token_id.to_string().starts_with(SHADOW_V1_TOKEN_PREFIX));
+                    let asset = self.internal_unwrap_asset(&token_id);
+                    assert!(asset.config.can_withdraw, "Withdrawals for this asset are not enabled");
+                    if account.supplied.get(&token_id).is_some() {
+                        let (amount, ft_amount) = self.internal_margin_withdraw_supply(
+                            account,
+                            &token_id,
+                            amount.map(|a| a.into()),
+                        );
+                        if ft_amount > 0 {
+                            self.internal_ft_transfer(account_id, &token_id, amount, ft_amount, true, account_id);
+                            events::emit::margin_asset_withdraw_started(&account_id, amount, &token_id);
+                        } else {
+                            events::emit::margin_asset_withdraw_succeeded(&account_id, amount, &token_id);
+                        }
+                    }
+                }
+                MarginAction::SetStop {
+                    pos_id,
+                    stop_profit,
+                    stop_loss,
+                } => {
+                    self.process_set_stop(account, &pos_id, stop_profit, stop_loss);
+                    events::emit::set_stop(account_id, &stop_profit, &stop_loss, &pos_id);
+
+                }
+            }
+        }
+    }
+
+    pub(crate) fn internal_margin_increase_collateral(
+        &mut self,
+        account: &mut MarginAccount,
+        pos_id: &PosId,
+        amount: Balance,
+    ) -> (AccountId, Balance) {
+        let mut mt = account
+            .margin_positions
+            .get(pos_id)
+            .expect("Position not exist")
+            .clone();
+        let asset_id = mt.token_c_id.clone();
+        let asset = self.internal_unwrap_asset(&mt.token_c_id);
+        assert!(asset.config.can_use_as_collateral, "This asset can't be used as a collateral");
+        // check if supply limit has hit, then need panic here
+        if !self.is_reliable_liquidator_context {
+            if let Some(supplied_limit) = asset.config.supplied_limit {
+                assert!(
+                    asset.supplied.balance <= supplied_limit.0, 
+                    "Asset {} has hit supply limit, increase margin collateral is not allowed", &asset_id
+                );
+            }
+        }
+        let shares = asset.supplied.amount_to_shares(amount, false);
+        let actual_amount = asset.supplied.shares_to_amount(shares, false);
+        account.withdraw_supply_shares(&mt.token_c_id, &shares);
+        mt.token_c_shares.0 += shares.0;
+        // Update existing margin_position storage
+        account.margin_positions.insert(&pos_id, &mt);
+        (asset_id, actual_amount)
+    }
+
+    pub(crate) fn internal_margin_decrease_collateral(
+        &mut self,
+        account: &mut MarginAccount,
+        pos_id: &PosId,
+        amount: Balance,
+        prices: &Prices,
+    ) -> AccountId {
+        let mut mt = account
+            .margin_positions
+            .get(pos_id)
+            .expect("Position not exist")
+            .clone();
+        assert!(
+            !mt.is_locking,
+            "Position is currently waiting for a trading result."
+        );
+        let pd = PositionDirection::new(&mt.token_c_id, &mt.token_d_id, &mt.token_p_id);
+        let mbtl = self.internal_unwrap_margin_base_token_limit_or_default(pd.get_base_token_id());
+        let token_id = mt.token_c_id.clone();
+        let asset = self.internal_unwrap_asset(&mt.token_c_id);
+        let shares = asset.supplied.amount_to_shares(amount, true);
+
+        // collateral can NOT decrease to 0
+        assert!(
+            mt.token_c_shares.0 > shares.0,
+            "Not enough collateral to decrease"
+        );
+        mt.token_c_shares.0 -= shares.0;
+
+        assert!(
+            !self.is_mt_liquidatable(&mt, prices, mbtl.min_safety_buffer),
+            "Margin position would be below liquidation line"
+        );
+        assert!(
+            !self.is_mt_forcecloseable(&mt, prices),
+            "Margin position would be below forceclose line"
+        );
+
+        assert!(
+            self.get_mtp_lr(&mt, prices).unwrap()
+                <= BigDecimal::from(mbtl.max_leverage_rate as u32),
+            "Leverage rate is too high"
+        );
+
+        account.deposit_supply_shares(&mt.token_c_id, &shares);
+        // Update existing margin_position storage
+        account.margin_positions.insert(&pos_id, &mt);
+
+        token_id
+    }
+
+    pub(crate) fn internal_margin_deposit(
+        &mut self,
+        account: &mut MarginAccount,
+        token_id: &TokenId,
+        amount: Balance,
+    ) -> Shares {
+        let mut asset = self.internal_unwrap_asset(token_id);
+        let shares: Shares = asset.supplied.amount_to_shares(amount, false);
+        account.deposit_supply_shares(token_id, &shares);
+        asset.supplied.deposit(shares, amount);
+        self.internal_set_asset(token_id, asset);
+        shares
+    }
+
+    #[allow(unused)]
+    pub(crate) fn internal_margin_deposit_without_asset_basic_check(
+        &mut self,
+        account: &mut MarginAccount,
+        token_id: &TokenId,
+        amount: Balance,
+    ) -> Shares {
+        let mut asset = self.internal_unwrap_asset(token_id);
+        let shares: Shares = asset.supplied.amount_to_shares(amount, false);
+        account.deposit_supply_shares(token_id, &shares);
+        asset.supplied.deposit(shares, amount);
+        self.internal_set_asset_without_asset_basic_check(token_id, asset);
+        shares
+    }
+
+    pub(crate) fn internal_margin_withdraw_supply(
+        &mut self,
+        account: &mut MarginAccount,
+        token_id: &AccountId,
+        amount: Option<Balance>,
+    ) -> (Balance, Balance) {
+        let mut asset = self.internal_unwrap_asset(token_id);
+        let (withdraw_shares, withdraw_amount) = if let Some(amount) = amount {
+            (asset.supplied.amount_to_shares(amount, true), amount)
+        } else {
+            let shares = account.supplied.get(token_id).unwrap().clone();
+            let amount = asset.supplied.shares_to_amount(shares, false);
+            (shares, amount)
+        };
+        let available_amount = asset.available_amount();
+        assert!(
+            withdraw_amount <= available_amount,
+            "Withdraw error: Exceeded available amount {} of {}",
+            available_amount,
+            token_id
+        );
+
+        let withdraw_ft_amount = withdraw_amount / 10u128.pow(asset.config.extra_decimals as u32);
+        if withdraw_ft_amount > 0 {
+            account.withdraw_supply_shares(token_id, &withdraw_shares);
+            asset.supplied.withdraw(withdraw_shares, withdraw_amount);
+            self.internal_set_asset(token_id, asset);
+            (withdraw_amount, withdraw_ft_amount)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
+#[near_bindgen]
+impl Contract {
+    /// Legacy margin entrypoint is closed.
+    /// Use margin_execute_with_pyth with MarginAction::Withdraw to withdraw supply.
+    #[allow(unused_variables)]
+    #[payable]
+    pub fn margin_execute(&mut self, actions: Vec<MarginAction>) {
+        env::panic_str(MARGIN_CLOSED_ENTRYPOINT_MSG);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unit_env::*;
+
+    #[test]
+    fn test_margin_actions_withdraw_only_allows_withdraw() {
+        assert_margin_actions_withdraw_only(&vec![MarginAction::Withdraw {
+            token_id: neth_token_id(),
+            amount: None,
+        }]);
+    }
+
+    #[test]
+    fn test_margin_execute_with_pyth_allows_withdraw_supply() {
+        let mut test_env = init_unit_env();
+        let account_id = alice();
+        let token_id = neth_token_id();
+        let amount = d(1, 18);
+
+        testing_env!(test_env.context.predecessor_account_id(owner_id()).attached_deposit(1).build());
+        test_env.contract.batch_enable_margin_actions(vec![MarginActionType::Withdraw]);
+
+        let mut account = test_env.contract.internal_unwrap_margin_account(&account_id);
+        test_env.contract.internal_margin_deposit_without_asset_basic_check(&mut account, &token_id, amount);
+        test_env.contract.internal_set_margin_account(&account_id, account);
+
+        testing_env!(test_env.context.predecessor_account_id(account_id.clone()).attached_deposit(1).build());
+        test_env.contract.margin_execute_with_pyth(vec![MarginAction::Withdraw {
+            token_id: token_id.clone(),
+            amount: None,
+        }]);
+
+        let margin_account = test_env.contract.get_margin_account(account_id).unwrap();
+        assert!(margin_account.supplied.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Margin is closed; only MarginAction::Withdraw is supported")]
+    fn test_margin_actions_withdraw_only_rejects_non_withdraw() {
+        assert_margin_actions_withdraw_only(&vec![MarginAction::SetStop {
+            pos_id: "pos-1".to_string(),
+            stop_profit: None,
+            stop_loss: None,
+        }]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Margin entrypoint is closed")]
+    fn test_margin_execute_is_closed() {
+        let mut test_env = init_unit_env();
+        testing_env!(test_env.context.predecessor_account_id(alice()).attached_deposit(1).build());
+
+        test_env.contract.margin_execute(vec![MarginAction::Withdraw {
+            token_id: neth_token_id(),
+            amount: None,
+        }]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Margin is closed; only MarginAction::Withdraw is supported")]
+    fn test_margin_execute_with_pyth_rejects_non_withdraw() {
+        let mut test_env = init_unit_env();
+        testing_env!(test_env.context.predecessor_account_id(alice()).attached_deposit(1).build());
+
+        test_env.contract.margin_execute_with_pyth(vec![MarginAction::SetStop {
+            pos_id: "pos-1".to_string(),
+            stop_profit: None,
+            stop_loss: None,
+        }]);
+    }
+}
